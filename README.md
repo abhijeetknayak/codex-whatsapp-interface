@@ -1,82 +1,133 @@
-# WhatsApp ↔ Codex: multiple named chats
+# WhatsApp ↔ Codex v2
 
-This is a personal WhatsApp bot bridging Meta WhatsApp Cloud API to **local Codex CLI** on Ubuntu. Each WhatsApp sender has multiple named Codex threads, stored in SQLite. A single WhatsApp conversation uses commands to switch the current thread. The CLI **inherits the sandbox and approval settings of the Ubuntu user running the bot** (including managed and project settings). The bot itself does not force read-only mode. Codex can edit files and run tests when those settings allow it. Non-interactive sessions cannot answer arbitrary interactive approval prompts.
+A locally hosted WhatsApp Cloud API bridge for an already-authorized Codex CLI installation. Developed for Ubuntu (`nayaka5`), Python 3.11+, and WhatsApp Cloud API webhooks. It does **not** use OpenAI API keys: it launches the locally authenticated Codex CLI under the same Linux account, inheriting its effective Codex settings and sandbox restrictions.
 
-It does **not** attach to a running tmux TUI. It starts/resumes persistent local Codex CLI sessions by thread ID. It is not ChatGPT Remote Control, and cannot override a workspace security restriction. Do not expose work code or devices if company policy forbids it.
+## Features
 
-## Chat commands
+- Preserves the existing bot's commands: `/new`, `/list`, `/use`, `/rename`, `/delete`, `/reset`, `/status`, `/help`, `/server`, `/import`, `/model`.
+- Adds `/thinking`: numbered reasoning-effort menu **from the selected model's supported options**. `/model` also uses the Codex app-server's live catalog, with a local cache fallback. Selections persist per chat in SQLite and are applied to `codex exec` and `codex exec resume`.
+- Adds `/usage`: reads `account/rateLimits/read` from local Codex app-server and prints *actual* 5-hour and weekly window data when provided, including percentage and reset. Other windows are shown if reported. Unsupported/unavailable windows are clearly marked, and bot-local token totals are separate.
+- Adds `/jobs` and `/history [N]`, plus a `last request + last answer + status` preview on `/use`.
+- Asynchronous jobs: switching chats does **not** interrupt Codex tasks. Each completion is tagged `[chatname]`. Different projects can run concurrently; **the same project is serialized** to avoid conflicting edits. A later message in the same chat waits for its predecessor to finish.
+- `/server [PAGE]` gets genuine titles from Codex app-server (`thread/list`), filtering out subagent/review threads. `/import NAME NUMBER` imports the chosen session using a saved numbered snapshot; its project path must be under `CODEX_ALLOWED_ROOTS`. `/use` can display a saved Codex last turn for an imported session, where the CLI supports history pagination.
+- SQLite persistence: inbound webhook deduplication, durable job queue, saved messages, replies and settings, plus an outgoing queue. Started jobs are marked **interrupted** after a crash, not automatically re-executed (important for code edits).
+- Keeps signed webhook verification, allowlisted phone numbers, local-only bind, and **no sandbox/approval bypass flags**.
 
-```
-/new research        # create and select new chat
-/new debugging       # another independent Codex chat
-/list                # show named chats; * means active
-/use research        # switch back, preserving context
-/rename research docs
-/status
-/reset               # forget active thread in bot (old history remains on disk)
-/delete debugging    # delete bot mapping, not local Codex history
-/help
-```
+### WhatsApp commands
 
-Names use ASCII letters, numbers, `_` or `-`, start with a letter, and are max 32 characters. All messages without slash commands go to the current chat. The initial default chat is `main`.
+| Command | Action |
+|---|---|
+| `/help` | All commands |
+| `/new robotics` | Create and select a named chat |
+| `/chats` or `/list` | List bot chats |
+| `/use robotics` | Switch + display latest prompt, answer, and status |
+| `/rename old new` | Rename chat locally |
+| `/delete name` | Delete local bot chat mapping + messages, **not** the actual Codex session |
+| `/reset` | Start a new Codex session in active chat (old history remains in Codex) |
+| `/model` then `1` | Set model (use `0` for default); `/model 2` while menu open also works |
+| `/thinking` then `2` | Set supported reasoning effort (use `0` for default) |
+| `/usage` | 5-hour + weekly quota where available; local token totals separately |
+| `/server` or `/server 2` | Browse Codex CLI/VS Code/exec sessions with readable names |
+| `/import legacy 7` | Import session number 7 from last `/server` snapshot |
+| `/jobs` | Running and queued tasks |
+| `/history 3` | Last three requests and Codex replies |
+| `/status` | Chat, model, thinking, directory, jobs |
+| `/project` or `/project /approved/project` | Show/set chat's working directory inside configured roots |
 
-## Prerequisites
+**Example workflow:** `/new robotics` → `Fix sensor calibration, run tests` → `/use planning` → `Explain the trajectory code` → `/use robotics` to see the latest exchange. If both projects point to the same directory, the second *task waits* while commands and chat switching still work.
 
-- Ubuntu host that can reach the internet and stays running
-- Python 3.10+ and `codex` installed and authenticated (`codex login`), under the **same Ubuntu account** running the bot
-- Meta Developer account, WhatsApp Business Platform / Cloud API test or production number, app secret, phone number ID, access token, and an approved receiving WhatsApp number
-- Public **HTTPS** webhook forwarding to localhost port 8000 (for example, an approved tunnel/reverse proxy); configure its path as `/webhook`
-- Meta application webhook subscription to the `messages` field
+## Upgrade from your existing WhatsApp bot
 
-## Install
+**Stop the old bot first.** Do not run both versions simultaneously. Keep your existing Cloudflare Tunnel running if it's already pointing to port 8000.
 
 ```bash
-unzip whatsapp_codex_native_permissions.zip
-cd whatsapp_codex_native_permissions
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+# Stop existing python bot.py in tmux first (Ctrl+C), then:
+cd /home/ubuntu
+unzip whatsapp_codex_v2.zip
+cd whatsapp_codex_v2
+
+# Keep a backup of your current bot database and environment.
+cp /home/ubuntu/whatsapp_codex_native_permissions/.env .env
+cp /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3 \
+   /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3.backup
+cp /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3 ./bot.sqlite3
+chmod 600 .env
 nano .env
+```
+
+If your old database path was customized with `BOT_DB_PATH`, copy **that** file instead (with the old bot stopped). If you have no previous database, skip the copies. The v2 database **adds columns** to your old `chats` table and migrates `chat_model_choices` when present. It does not delete saved Codex CLI sessions.
+
+In `.env`, **update these three paths**:
+
+```dotenv
+CODEX_PROJECT_DIR=/home/ubuntu/VLA-Planning
+CODEX_ALLOWED_ROOTS=/home/ubuntu/VLA-Planning
+BOT_DB_PATH=/home/ubuntu/whatsapp_codex_v2/bot.sqlite3
+```
+
+Add any additional approved project directories to `CODEX_ALLOWED_ROOTS`, comma-separated. Existing imported chats from projects outside allowed roots can still exist in SQLite; import and `/project` cannot select unauthorized paths. Run v2 as `ubuntu` to use the same `~/.codex` login and model catalog.
+
+Install Python dependencies in your **existing environment** (Conda `agent` in your previous logs):
+
+```bash
+conda activate agent
+cd /home/ubuntu/whatsapp_codex_v2
+python -m pip install -r requirements.txt
+python -m py_compile bot.py codex_api.py store.py
 codex --version
-codex login status
 python bot.py
 ```
 
-In `.env`, fill in Meta credentials and your personal number (country code and digits, no `+`). Set `CODEX_PROJECT_DIR` to the authorized folder on `nayaka5`. `META_APP_SECRET` is for verifying `X-Hub-Signature-256`; the verify token is a separate random string, which must match your Meta webhook configuration.
+Your signed webhook still accepts `GET /webhook` and `POST /webhook`; the callback URL in Meta remains `https://YOUR-STABLE-HOST/webhook`. You don't need to re-subscribe your WABA merely because the Python process changed. Keep a valid system-user access token in `.env` and verify its **WhatsApp asset assignment** (previous Meta error `Viewer cannot access the provided Paid Message Account`). The app, phone ID, and App Secret must belong to the same configuration.
 
-The Flask app listens on `127.0.0.1:8000`. Your HTTPS proxy/tunnel must forward to it, e.g. webhook callback URL `https://your-approved-domain.example/webhook`. Keep the credentials secret and restrict who can reach the proxy. For production deployments, use a supported application server and durable work queue instead of the included single-process development runner.
+### First tests from your phone
 
-## Behaviour and limitations
+1. `/help` — verifies outgoing Meta messaging.
+2. `/chats` — verifies database migration.
+3. `/model` then a number, `/thinking` then a number — verify the menu works.
+4. `/usage` — checks whether your Codex login exposes 5-hour and weekly quotas.
+5. `/server` and `/server 2` — verify familiar session titles appear.
+6. `/new test` then `Tell me the current directory; do not edit any files.` — verify Codex execution.
+7. Switch `/use main` while a task in another project is running, then switch back.
 
-- One local worker processes jobs serially; each named chat preserves its own CLI thread context. Chat history survives bot restarts if `bot.sqlite3` is preserved.
-- Sessions all run with `CODEX_PROJECT_DIR` as their working directory. Different chats are not separate repositories or sandboxes. For parallel repositories, deploy separately or extend the configuration with a per-chat allowlist.
-- New threads are created when the first message arrives. The bot saves `thread.started` IDs and uses `codex exec --json resume SESSION_ID -` on follow-up turns.
-- By default, WhatsApp Cloud API customer-service replies have a 24-hour window after an inbound message; outbound templates may be required outside it. Meta may charge message fees.
-- Incoming webhook signatures and an explicit sender allowlist are enforced. Do **not** set broad access. The bot keeps conversation metadata in an unencrypted local SQLite DB and Codex stores its own conversation history locally.
-- The bot **does not override** Codex sandbox or approval settings. For `on-request` approvals, operations that need interactive approval may fail or stop; the bot does not grant itself more access. Never set `danger-full-access` or `approval_policy = "never"` just to make WhatsApp automation work. If appropriate, use workspace-write with an approved project directory.
-- The sample uses an in-memory job queue. Requests in flight can be lost during a process restart, and WhatsApp delivery failures require reviewing logs.
-- WhatsApp messages may be handled by Meta's systems. Avoid sensitive credentials, secrets, or employer-confidential source material without permission.
-- This does not attach to a live tmux TUI, share the IDE extension chat automatically, or let WhatsApp act as a replacement for VS Code. It can create/edit code in the configured project when Codex permissions permit it. It is a text-command interface to Codex CLI.
+If model-list or usage reads fail, check that `codex app-server` works under the same Linux user and that Codex is signed in with a supported ChatGPT account. These features depend on your installed CLI and account. The bot never invents usage limits.
 
-Reference: https://learn.chatgpt.com/docs/cli/reference
+## Optional: stable production service
 
-## Using your existing Codex permissions
-
-The bot intentionally calls `codex exec --json` (and `codex exec --json resume ...`) **without** `--sandbox`, `--ask-for-approval`, `--yolo`, or `--skip-git-repo-check`. It inherits the effective configuration from the Codex CLI launched as the bot's Linux user, including `~/.codex/config.toml`, trusted project configuration, and managed policy.
-
-Check the account and settings first:
+After you confirm v2 works, replace the temporary `trycloudflare.com` Quick Tunnel with a named Cloudflare Tunnel on your domain, and run the bot using `systemd` instead of tmux. A template is included in `whatsapp-codex-v2.service.example`. **Stop the tmux bot before enabling systemd.** The example uses Gunicorn with *one* worker process (multiple workers would start duplicate queue processors); the bot itself handles concurrent Codex tasks using threads.
 
 ```bash
-whoami
-codex login status
-cat ~/.codex/config.toml
-cd /path/to/your/project
-codex exec 'Inspect the repository, do not change files, and report the configured execution context.'
+sudo cp whatsapp-codex-v2.service.example /etc/systemd/system/whatsapp-codex.service
+sudo nano /etc/systemd/system/whatsapp-codex.service  # verify paths
+sudo systemctl daemon-reload
+sudo systemctl enable --now whatsapp-codex
+journalctl -u whatsapp-codex -f
 ```
 
-If your interactive Codex session was started with **command-line permission overrides**, those transient overrides do not automatically carry into this independent process. Configure the **approved** equivalent in Codex config if you actually want it to apply to the bot. Never assume the bot has the exact same effective permissions until you test a harmless file edit in a dedicated test repo.
+Gunicorn should bind `127.0.0.1:8000`, not all network interfaces. Your Cloudflare connector forwards only to the localhost service. `systemd` should run the service as the same Linux user that owns the Codex sessions and `.env`.
 
-For example, send `/new test` and then `Create a file called whatsapp_codex_test.txt containing hello`. Verify the file appears where expected. Delete it afterward. If Codex reports an approval denial, leave the boundary in place and use the local terminal for that task or implement an explicit approval flow after review.
+## Behavior, safety, and limits
 
-**Security**: WhatsApp messages can trigger local code edits and shell commands. Restrict the sender list, keep Meta credentials secure, restrict the workspace to an approved repo, and do not use this setup to circumvent an organization's disabled remote-control setting.
+- `/use` sends a **new WhatsApp message** with the last exchange. WhatsApp cannot erase or replace the visible message history in its own UI.
+- Model and reasoning preferences affect **future turns**. Supported effort levels come from the currently reported model catalog. If a session is resumed under a different model, Codex may warn about the change.
+- The bot does not attach to a **live tmux/interactive Codex session**. It resumes persisted session histories. Don't send simultaneous turns to a session from two different clients.
+- Non-interactive approval prompts are **not handled** by this bot; it does not add `--yolo` or bypass sandbox checks. Local and workspace policies still apply.
+- `MAX_CODEX_WORKERS` controls concurrent tasks across **different** project directories. A repo is serialized irrespective of chat name. No auto-retry of interrupted code edits: inspect files before retrying a failed task.
+- Meta replies may fail if the WhatsApp system-user token expires, loses asset access, or is outside WhatsApp's permitted conversation window. Outgoing API 4xx errors are logged and not retried indefinitely. Network-ambiguous sends are marked `uncertain` to avoid automatic duplicate messages.
+- Never place Meta access tokens, App Secret, Codex authentication files, or your personal phone numbers in screenshots or pasted logs. `.env` stays local with mode `0600`.
+- Restrict `CODEX_ALLOWED_ROOTS` to directories you actually want accessible, and follow your organization’s policies before exposing a company-managed machine to a WhatsApp bridge.
+
+## Tests
+
+```bash
+cd whatsapp_codex_v2
+PYTHONPATH=.:tests python -m unittest discover -s tests -v
+```
+
+Tests use simulated Meta payloads and a **fake Codex executable**, so they don't contact your account or modify a real repository. The test suite has a tiny Flask shim for environments where Flask cannot be installed; production always uses the real Flask dependency.
+
+## Reference documentation
+
+- [Codex CLI command reference](https://learn.chatgpt.com/docs/cli/reference)
+- [Codex app-server: `model/list`, `thread/list`, `account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server)
+- [WhatsApp Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api/)

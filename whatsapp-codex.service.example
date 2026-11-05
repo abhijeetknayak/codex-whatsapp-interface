@@ -1,0 +1,19 @@
+# Copy to /etc/systemd/system/whatsapp-codex.service AFTER changing paths.
+# Do not run the tmux bot and this service at the same time.
+[Unit]
+Description=WhatsApp Codex v2
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/whatsapp_codex_v2
+# Example uses the user's existing conda env; verify gunicorn is installed there.
+ExecStart=/home/ubuntu/miniconda3/envs/agent/bin/gunicorn --workers 1 --threads 8 --bind 127.0.0.1:8000 bot:app
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
