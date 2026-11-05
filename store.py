@@ -51,11 +51,22 @@ class Store:
                     sender TEXT NOT NULL, name TEXT NOT NULL, generation INTEGER NOT NULL,
                     cwd TEXT NOT NULL, prompt TEXT NOT NULL, response TEXT,
                     status TEXT NOT NULL, model TEXT, effort TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     thread_id TEXT, submitted_at REAL NOT NULL,
                     started_at REAL, finished_at REAL,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     error TEXT);
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id INTEGER NOT NULL, sender TEXT NOT NULL, name TEXT NOT NULL,
+                    method TEXT NOT NULL, request_id TEXT NOT NULL, details TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                    decided_at REAL,
+                    UNIQUE(turn_id,request_id));
+                CREATE INDEX IF NOT EXISTS ix_approvals_sender_status
+                    ON approvals(sender,status,expires_at);
                 CREATE TABLE IF NOT EXISTS menus (
                     sender TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
                     options TEXT NOT NULL, created_at REAL NOT NULL);
@@ -74,6 +85,9 @@ class Store:
                                  ("cwd", "TEXT"), ("generation", "INTEGER NOT NULL DEFAULT 0")):
                 if field not in fields:
                     c.execute(f"ALTER TABLE chats ADD COLUMN {field} {dtype}")
+            turn_fields = {r[1] for r in c.execute("PRAGMA table_info(turns)").fetchall()}
+            if "cancel_requested" not in turn_fields:
+                c.execute("ALTER TABLE turns ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
             c.execute("UPDATE chats SET cwd=? WHERE cwd IS NULL OR cwd=''", (self.default_cwd,))
             # Prior per-chat model selector, if present.
             if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_model_choices'").fetchone():
@@ -81,6 +95,8 @@ class Store:
                     WHERE m.sender=chats.sender AND m.name=chats.name)
                     WHERE model IS NULL AND EXISTS (SELECT 1 FROM chat_model_choices m
                     WHERE m.sender=chats.sender AND m.name=chats.name)""")
+            # On restart no app-server process remains to receive old approvals.
+            c.execute("UPDATE approvals SET status='stale',decided_at=? WHERE status='pending'", (time.time(),))
             # Crash recovery: never re-run an already-started code-changing turn.
             c.execute("""UPDATE turns SET status='interrupted',
                 error='Bot restarted during execution; check files before retrying',
@@ -303,6 +319,41 @@ class Store:
             c.commit()
             return cur.lastrowid, chat["name"]
 
+    def cancel_turn(self, sender: str, turn_id: int) -> dict:
+        """Atomically cancel queued work or request cancellation of a running turn.
+
+        Never acts on another sender's task; workers monitor the durable flag.
+        """
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT id,name,status,cancel_requested FROM turns WHERE id=? AND sender=?",
+                (turn_id, sender)).fetchone()
+            if row is None:
+                c.commit()
+                return {"state": "missing"}
+            result = {"id": row["id"], "name": row["name"], "status": row["status"]}
+            if row["status"] == "queued":
+                c.execute("""UPDATE turns SET status='cancelled', cancel_requested=1,
+                    finished_at=?, error='Cancelled before execution' WHERE id=?""",
+                    (time.time(), turn_id))
+                result["state"] = "queued_cancelled"
+            elif row["status"] == "running":
+                if row["cancel_requested"]:
+                    result["state"] = "already_requested"
+                else:
+                    c.execute("UPDATE turns SET cancel_requested=1 WHERE id=?", (turn_id,))
+                    result["state"] = "running_requested"
+            else:
+                result["state"] = "finished"
+            c.commit()
+            return result
+
+    def is_cancel_requested(self, turn_id: int) -> bool:
+        with self.db() as c:
+            row = c.execute("SELECT cancel_requested FROM turns WHERE id=?", (turn_id,)).fetchone()
+            return bool(row and row["cancel_requested"])
+
     def claim_turn(self) -> dict | None:
         """Serialize all jobs in the same repo; allow different repos in parallel."""
         with self.db() as c:
@@ -330,6 +381,19 @@ class Store:
                     output_tokens: int = 0, error: str = ""):
         with self.db() as c:
             c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT status,cancel_requested FROM turns WHERE id=?", (turn["id"],)).fetchone()
+            if not row:
+                c.commit()
+                return "missing"
+            if row["status"] != "running":
+                c.commit()
+                return row["status"]
+            if row["cancel_requested"] or status == "cancelled":
+                # A running task may have written files before termination.
+                status = "cancelled"
+                error = "Cancellation requested; file changes may remain. " + error
+                thread_id = None  # Never advance the chat to an incomplete turn.
+                response = ""
             c.execute("""UPDATE turns SET response=?,status=?,thread_id=?,finished_at=?,
                 input_tokens=?,output_tokens=?,error=? WHERE id=?""",
                 (response, status, thread_id, time.time(), input_tokens, output_tokens, error, turn["id"]))
@@ -338,6 +402,7 @@ class Store:
                     AND generation=?""",
                     (thread_id, turn["sender"], turn["name"], turn["generation"]))
             c.commit()
+            return status
 
     def history(self, sender: str, name: str, count: int = 1) -> list[dict]:
         chat = self.chat(sender, name)
@@ -350,7 +415,7 @@ class Store:
 
     def pending_jobs(self, sender: str, limit: int = 20) -> list[dict]:
         with self.db() as c:
-            rows = c.execute("""SELECT id,name,prompt,status,submitted_at FROM turns
+            rows = c.execute("""SELECT id,name,prompt,status,cancel_requested,submitted_at FROM turns
                 WHERE sender=? AND status IN ('running','queued') ORDER BY id LIMIT ?""", (sender, limit)).fetchall()
             return [dict(r) for r in rows]
 
@@ -364,3 +429,84 @@ class Store:
         with self.db() as c:
             row = c.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
             return dict(row) if row else None
+
+    def create_approval(self, turn: dict, method: str, request_id: str,
+                        details: str, timeout: int) -> int:
+        """Persist approval and outbound prompt in one atomic transaction."""
+        now = time.time()
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            cur = c.execute("""INSERT INTO approvals(
+                turn_id,sender,name,method,request_id,details,created_at,expires_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (turn["id"], turn["sender"], turn["name"], method, request_id,
+                 details, now, now+timeout))
+            aid = cur.lastrowid
+            msg = (f"APPROVAL #{aid} for task #{turn['id']} [{turn['name']}]\n"
+                   f"{details}\n\nRespond /approve {aid} or /deny {aid}. "
+                   f"Expires in {timeout // 60}m; only this action can be approved.")
+            # Avoid partial WhatsApp chunks that could hide the action or buttons.
+            if len(msg) > 3000:
+                c.rollback()
+                raise ValueError("Approval message too large for one WhatsApp message")
+            c.execute("""INSERT INTO outbox(recipient,body,status,created_at)
+                VALUES(?,?,'pending',?)""", (turn["sender"], msg, now))
+            c.commit()
+            return aid
+
+    def approval_decision(self, approval_id: int) -> str:
+        with self.db() as c:
+            row = c.execute("SELECT status,expires_at FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            if not row:
+                return "stale"
+            if row["status"] == "pending" and time.time() >= row["expires_at"]:
+                self.expire_approval(approval_id)
+                return "expired"
+            return row["status"]
+
+    def decide_approval(self, sender: str, approval_id: int, approve: bool) -> dict:
+        """Only the original verified WhatsApp sender may decide, once."""
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT * FROM approvals WHERE id=? AND sender=?", (approval_id, sender)).fetchone()
+            if not row:
+                c.commit()
+                return {"state": "missing"}
+            result = {"name": row["name"], "turn_id": row["turn_id"]}
+            if row["status"] != "pending":
+                result["state"] = row["status"]
+            elif time.time() >= row["expires_at"]:
+                c.execute("UPDATE approvals SET status='expired',decided_at=? WHERE id=?",
+                          (time.time(), approval_id))
+                result["state"] = "expired"
+            else:
+                status = "approved" if approve else "denied"
+                c.execute("UPDATE approvals SET status=?,decided_at=? WHERE id=?",
+                          (status, time.time(), approval_id))
+                result["state"] = status
+            c.commit()
+            return result
+
+    def expire_approval(self, approval_id: int):
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT sender,turn_id,status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            if row and row["status"] == "pending":
+                c.execute("UPDATE approvals SET status='expired',decided_at=? WHERE id=?",
+                          (time.time(), approval_id))
+                c.execute("""INSERT INTO outbox(recipient,body,status,created_at)
+                    VALUES(?,?,'pending',?)""",
+                    (row["sender"], f"Approval #{approval_id} expired; denied for task #{row['turn_id']}.", time.time()))
+            c.commit()
+
+    def close_turn_approvals(self, turn_id: int):
+        with self.db() as c:
+            c.execute("""UPDATE approvals SET status='stale',decided_at=?
+                WHERE turn_id=? AND status='pending'""", (time.time(), turn_id))
+
+    def pending_approvals(self, sender: str) -> list[dict]:
+        with self.db() as c:
+            rows = c.execute("""SELECT id,turn_id,name,details,expires_at FROM approvals
+                WHERE sender=? AND status='pending' AND expires_at>? ORDER BY id""",
+                (sender, time.time())).fetchall()
+            return [dict(r) for r in rows]

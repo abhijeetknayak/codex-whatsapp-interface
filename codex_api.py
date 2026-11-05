@@ -10,11 +10,12 @@ import logging
 import os
 import re
 import select
+import signal
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 LOG = logging.getLogger(__name__)
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -23,6 +24,10 @@ EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 class CodexError(RuntimeError):
     pass
+
+
+class CodexCancelled(CodexError):
+    """An explicit user cancellation, not a Codex error."""
 
 
 def rpc_call(codex_bin: str, method: str, params: dict | None = None, timeout: int = 15) -> dict:
@@ -321,9 +326,19 @@ def lookup_session_cwd(codex_home: Path, session_id: str) -> str | None:
 
 
 def run_codex(codex_bin: str, cwd: Path, prompt: str, thread_id: str | None,
-              model: str | None, effort: str | None, timeout: int) -> dict:
-    """Run one turn; never uses shell=True or bypasses user sandbox settings."""
-    cmd = [codex_bin, "exec", "--json", "--skip-git-repo-check"]
+              model: str | None, effort: str | None, timeout: int,
+              should_cancel: Callable[[], bool] | None = None,
+              sandbox: str = "workspace-write") -> dict:
+    """Run a Codex turn inside its configured/explicit workspace sandbox.
+
+    CLI sandbox mode is limited to workspace-write/read-only/inherit for a
+    WhatsApp-exposed agent. Never disable approvals or use full host access.
+    """
+    if sandbox not in ("workspace-write", "read-only", "inherit"):
+        raise CodexError("Invalid CODEX_SANDBOX_MODE: choose workspace-write, read-only, or inherit")
+    cmd = [codex_bin, "exec", "--json"]
+    if sandbox != "inherit":
+        cmd.extend(["--sandbox", sandbox])
     if model:
         if not MODEL_ID.fullmatch(model):
             raise CodexError("Invalid model ID")
@@ -338,21 +353,67 @@ def run_codex(codex_bin: str, cwd: Path, prompt: str, thread_id: str | None,
         cmd.append("-")
 
     LOG.info("Codex task in %s, resuming=%s", cwd, bool(thread_id))
+    if should_cancel and should_cancel():
+        raise CodexCancelled("Cancelled before Codex started")
     try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, input=prompt, text=True, capture_output=True,
-            timeout=timeout, check=False,
+        # Own process group: stop only this task and the commands it launched.
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=(os.name == "posix"),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise CodexError(f"Codex exceeded {timeout}s; task result uncertain. Check local files before retrying.") from exc
     except OSError as exc:
         raise CodexError(f"Cannot start Codex CLI: {exc}") from exc
+
+    def stop_child():
+        if proc.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix":
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+
+    started = time.monotonic()
+    first = True
+    try:
+        while True:
+            if should_cancel and should_cancel():
+                raise CodexCancelled("User cancelled the running task")
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise CodexError(
+                    f"Codex exceeded {timeout}s; task result uncertain. Check local files before retrying.")
+            try:
+                # communicate() can safely be retried following TimeoutExpired;
+                # it retains prior stdout/stderr and unfinished stdin writes.
+                stdout, stderr = proc.communicate(
+                    input=prompt if first else None, timeout=min(0.3, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                first = False
+        if should_cancel and should_cancel():
+            raise CodexCancelled("Cancellation arrived as Codex finished")
+    except BaseException:
+        stop_child()
+        raise
 
     actual_thread = thread_id
     responses, errors, warnings = [], [], []
     in_tokens = out_tokens = 0
     had_completed = False
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
@@ -375,12 +436,12 @@ def run_codex(codex_bin: str, cwd: Path, prompt: str, thread_id: str | None,
             in_tokens += int(usage.get("input_tokens") or 0)
             out_tokens += int(usage.get("output_tokens") or 0)
     if proc.returncode != 0:
-        errors.append(f"Codex exited {proc.returncode}: {proc.stderr[-500:]}")
+        errors.append(f"Codex exited {proc.returncode}: {stderr[-500:]}")
     if errors:
         raise CodexError(" | ".join(errors)[-1200:])
     if not had_completed:
         raise CodexError(f"Codex did not finish a turn (exit {proc.returncode}). "
-                         f"{' | '.join(warnings)[-400:]} {proc.stderr[-400:]}")
+                         f"{' | '.join(warnings)[-400:]} {stderr[-400:]}")
     if warnings:
         LOG.warning("Codex reported %d nonfatal notices: %s", len(warnings), " | ".join(warnings)[-500:])
     return {

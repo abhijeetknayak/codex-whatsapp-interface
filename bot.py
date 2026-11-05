@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WhatsApp Codex Bot v2: named conversations, independent jobs, usage and menus.
+"""WhatsApp Codex Bot v2.3: named chats, write sandbox, cancellation, usage and menus.
 
 Run: python bot.py
 Production: gunicorn --workers 1 --threads 8 --bind 127.0.0.1:8000 'bot:app'
@@ -21,10 +21,11 @@ from dotenv import load_dotenv
 from flask import Flask, abort, request
 
 from codex_api import (
-    CodexError, account_usage, list_server_threads, load_models,
+    CodexCancelled, CodexError, account_usage, list_server_threads, load_models,
     lookup_session_cwd, last_saved_exchange, run_codex,
 )
 from store import Store
+from appserver_runner import run_codex_interactive
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env", override=True)  # Make edited .env authoritative on restart
@@ -34,7 +35,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
 CHAT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 PHONE_RE = re.compile(r"^[0-9]{7,20}$")
 
-HELP = """WhatsApp Codex v2
+HELP = """WhatsApp Codex v2.3
 /new NAME - create a chat
 /chats or /list - list bot chats
 /use NAME - switch and show last request + reply
@@ -48,14 +49,18 @@ HELP = """WhatsApp Codex v2
 /usage - account 5-hour and weekly rate limits
 /status - active chat and configuration
 /jobs - queued/running tasks
+/cancel NUMBER - cancel a queued or running task
+/approvals - list pending approval requests
+/approve NUMBER - allow one requested action
+/deny NUMBER - reject one requested action
 /history [N] - show recent requests and answers
 /project [PATH] - show/change project within allowed roots
 /help - show commands
 
 Plain text starts a task in the active chat. Switch chats while it runs;
 completed replies are labelled with their originating chat.
-For numbered menus reply with the number shown. No extra sandbox or
-approval bypass flags are set by this bot."""
+For numbered menus reply with the number shown. Codex runs with
+workspace-write sandbox by default; Codex approvals are relayed to WhatsApp."""
 
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
@@ -74,6 +79,7 @@ class Config:
         self.allowed_numbers = {s.strip().lstrip("+") for s in
                                 os.getenv("ALLOWED_WHATSAPP_NUMBERS", "").split(",") if s.strip()}
         self.codex_bin = os.getenv("CODEX_BIN", "codex")
+        self.codex_sandbox = os.getenv("CODEX_SANDBOX_MODE", "workspace-write").strip().lower()
         self.graph_version = os.getenv("META_GRAPH_VERSION", "v26.0")
         self.project_dir = Path(os.getenv("CODEX_PROJECT_DIR", str(Path.home()))).expanduser().resolve()
         self.codex_home = Path(os.getenv("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
@@ -84,6 +90,7 @@ class Config:
         self.task_timeout = _env_int("CODEX_TIMEOUT_SECONDS", 900, 30, 7200)
         self.port = _env_int("PORT", 8000, 1, 65535)
         self.model_fallback = os.getenv("CODEX_MODEL_OPTIONS", "")
+        self.approval_timeout = _env_int("APPROVAL_TIMEOUT_SECONDS", 600, 60, 3600)
 
     def validate(self):
         fields = {"META_APP_SECRET": self.app_secret,
@@ -94,6 +101,8 @@ class Config:
         missing = [name for name, value in fields.items() if not value]
         if missing:
             raise RuntimeError("Missing settings: " + ", ".join(missing))
+        if self.codex_sandbox not in ("workspace-write", "read-only", "inherit"):
+            raise RuntimeError("CODEX_SANDBOX_MODE must be workspace-write, read-only, or inherit")
         if not self.project_dir.is_dir():
             raise RuntimeError(f"CODEX_PROJECT_DIR does not exist: {self.project_dir}")
         if not self.is_safe_project(self.project_dir):
@@ -113,7 +122,11 @@ def last_exchange_text(store: Store, sender: str, name: str, count: int = 1) -> 
     blocks = []
     for job in history:
         prompt = job["prompt"]
-        response = job.get("response") or "(No completed response yet)"
+        response = job.get("response") or (
+            "(Cancelled; file changes may remain)" if job["status"] == "cancelled" else
+            f"({job['status']}: {job.get('error') or 'No reply'})"
+            if job["status"] in ("failed", "interrupted") else
+            "(No completed response yet)")
         blocks.append(f"Task #{job['id']} [{job['status']}]\nYou: {prompt}\nCodex: {response}")
     return "\n\n".join(blocks)
 
@@ -230,15 +243,30 @@ class Bot:
             sender, name = turn["sender"], turn["name"]
             try:
                 previous = self.store.thread_for_turn(turn)
-                output = run_codex(self.cfg.codex_bin, Path(turn["cwd"]), turn["prompt"],
-                                   previous, turn["model"], turn["effort"], self.cfg.task_timeout)
-                self.store.finish_turn(turn, output["response"], "done", output["thread_id"],
-                                       output["input_tokens"], output["output_tokens"])
-                self.store.reply(sender, f"[{name}] Task #{turn['id']} completed\n\n{output['response']}")
+                output = run_codex_interactive(
+                    self.cfg.codex_bin, Path(turn["cwd"]), turn["prompt"],
+                    previous, turn["model"], turn["effort"], self.cfg.task_timeout,
+                    should_cancel=lambda: self.store.is_cancel_requested(turn["id"]),
+                    store=self.store, turn=turn, sandbox=self.cfg.codex_sandbox,
+                    approval_timeout=self.cfg.approval_timeout)
+                final_status = self.store.finish_turn(
+                    turn, output["response"], "done", output["thread_id"],
+                    output["input_tokens"], output["output_tokens"])
+                if final_status == "cancelled":
+                    self.store.reply(sender, f"[{name}] Task #{turn['id']} cancelled. Changes already made may remain.")
+                elif final_status == "done":
+                    self.store.reply(sender, f"[{name}] Task #{turn['id']} completed\n\n{output['response']}")
+            except CodexCancelled as exc:
+                LOG.info("Codex task %s cancelled: %s", turn["id"], exc)
+                self.store.finish_turn(turn, "", "cancelled", error=str(exc)[:700])
+                self.store.reply(sender, f"[{name}] Task #{turn['id']} cancelled. Changes already made may remain.")
             except Exception as exc:
                 LOG.exception("Codex task %s failed", turn["id"])
-                self.store.finish_turn(turn, "", "failed", error=str(exc)[:1000])
-                self.store.reply(sender, f"[{name}] Task #{turn['id']} failed: {str(exc)[:500]}")
+                final_status = self.store.finish_turn(turn, "", "failed", error=str(exc)[:1000])
+                if final_status == "cancelled":
+                    self.store.reply(sender, f"[{name}] Task #{turn['id']} cancelled. Changes already made may remain.")
+                elif final_status == "failed":
+                    self.store.reply(sender, f"[{name}] Task #{turn['id']} failed: {str(exc)[:500]}")
 
     def menu_choice(self, sender: str, name: str, raw: str):
         menu = self.store.menu(sender, name)
@@ -369,7 +397,7 @@ class Bot:
                     f"Model: {chat['model'] or 'Codex default'}\n"
                     f"Thinking: {chat['effort'] or 'Codex default'}\n"
                     f"Running/queued: {len(self.store.pending_jobs(sender))}\n"
-                    "Permissions: inherited from local Codex configuration")
+                    f"Sandbox: {self.cfg.codex_sandbox} (Codex approval rules still apply)")
         if command == "/model":
             if not args:
                 return self.model_menu(sender, chat)
@@ -405,7 +433,48 @@ class Bot:
         if command == "/jobs":
             jobs = self.store.pending_jobs(sender)
             return ("Active jobs:\n" + "\n".join(
-                f"#{j['id']} [{j['name']}] {j['status']}: {j['prompt'][:90]}" for j in jobs)) if jobs else "No queued/running jobs."
+                f"#{j['id']} [{j['name']}] "
+                f"{'cancelling' if j['cancel_requested'] else j['status']}: {j['prompt'][:90]}"
+                for j in jobs) + "\nCancel using /cancel NUMBER") if jobs else "No queued/running jobs."
+        if command == "/cancel":
+            if len(args) != 1 or not re.fullmatch(r"[0-9]{1,10}", args[0]) or int(args[0]) < 1:
+                return "Usage: /cancel TASK_NUMBER (find the number using /jobs)"
+            task_id = int(args[0])
+            result = self.store.cancel_turn(sender, task_id)
+            state = result["state"]
+            if state == "missing":
+                return f"Task #{task_id} not found for your WhatsApp number. Use /jobs."
+            if state == "queued_cancelled":
+                return f"[{result['name']}] Task #{task_id} cancelled before starting."
+            if state == "running_requested":
+                return (f"[{result['name']}] Cancellation requested for task #{task_id}. "
+                        "Stopping Codex; any file changes already made may remain. "
+                        "You'll receive a confirmation when it stops.")
+            if state == "already_requested":
+                return f"[{result['name']}] Task #{task_id} is already cancelling."
+            return f"Task #{task_id} already finished ({result['status']})."
+        if command == "/approvals":
+            pending = self.store.pending_approvals(sender)
+            if not pending:
+                return "No pending Codex approvals."
+            return ("Pending approvals:\n" + "\n".join(
+                f"#{a['id']} [{a['name']}] task #{a['turn_id']}: {a['details'][:180]}"
+                for a in pending) + "\nUse /approve NUMBER or /deny NUMBER")
+        if command in ("/approve", "/deny"):
+            if len(args) != 1 or not re.fullmatch(r"[0-9]{1,10}", args[0]) or int(args[0]) < 1:
+                return f"Usage: {command} APPROVAL_NUMBER (find it in /approvals)"
+            aid = int(args[0])
+            outcome = self.store.decide_approval(sender, aid, command == "/approve")
+            state = outcome["state"]
+            if state == "missing":
+                return f"Approval #{aid} not found for your number."
+            if state in ("approved", "denied"):
+                if (state == "approved") != (command == "/approve"):
+                    return f"Approval #{aid} is already {state}; it can no longer be changed."
+                action = "Approved" if state == "approved" else "Denied"
+                return (f"{action} approval #{aid} for task #{outcome['turn_id']} "
+                        f"[{outcome['name']}]. Codex will continue.")
+            return f"Approval #{aid} is {state}; it can no longer be changed."
         if command == "/history":
             if len(args) > 1 or (args and not args[0].isdecimal()):
                 return "Usage: /history [1-5]"
@@ -422,9 +491,9 @@ class Bot:
             except (CodexError, OSError) as exc:
                 return f"Could not list Codex sessions: {exc}"
         if command == "/import":
-            if len(args) != 1 or not args[0].isdecimal():
-                return "Usage: /import NUMBER (from /server)"
-            choice = self.store.server_choice(sender, int(args[0]))
+            if len(args) != 2 or not CHAT_NAME.fullmatch(args[0]) or not args[1].isdecimal():
+                return "Usage: /import NAME NUMBER (from /server)"
+            choice = self.store.server_choice(sender, int(args[1]))
             if choice is None:
                 return "No matching saved choice. Send /server again."
             project = choice.get("cwd") or lookup_session_cwd(self.cfg.codex_home, choice["thread_id"])

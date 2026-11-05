@@ -2,6 +2,7 @@
 """Minimal Codex process simulator for offline smoke tests."""
 import json
 import sys
+import time
 
 def output(obj):
     print(json.dumps(obj), flush=True)
@@ -40,11 +41,16 @@ if sys.argv[1:2] == ["app-server"]:
             output({"id": rid, "error": {"message": "unsupported"}})
 elif sys.argv[1:2] == ["exec"]:
     prompt = sys.stdin.read()
+    if "sleep_forever" in prompt:
+        time.sleep(60)
     output({"type": "thread.started", "thread_id": "01a1a111-1111-1111-1111-111111111111"})
     output({"type": "turn.started"})
     if "warning" in prompt.lower():
         output({"type": "item.completed", "item": {"type": "error", "message": "Deprecated feature flag"}})
-    output({"type": "item.completed", "item": {"type": "agent_message", "text": "Mock response: " + prompt}})
+    response_text = "Mock response: " + prompt
+    if "print_cli_args" in prompt:
+        response_text = "CLI args: " + " ".join(sys.argv[1:])
+    output({"type": "item.completed", "item": {"type": "agent_message", "text": response_text}})
     output({"type": "turn.completed", "usage": {"input_tokens": 23, "output_tokens": 14}})
 else:
     print("Unknown fake command", file=sys.stderr)

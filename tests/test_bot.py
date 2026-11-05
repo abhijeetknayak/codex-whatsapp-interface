@@ -56,6 +56,7 @@ class BotTests(unittest.TestCase):
         cfg.project_dir = self.repo1
         cfg.allowed_roots = [self.dir]
         cfg.db_path = self.dir / "store.sqlite3"
+        cfg.codex_sandbox = "workspace-write"
         self.store = Store(cfg.db_path, str(cfg.project_dir))
         self.bot = botmod.Bot(cfg, store=self.store)
         self.sender = "491234567890"
@@ -115,6 +116,64 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.current(self.sender)["thread_id"], "thread1")
         self.assertEqual(self.store.token_stats(self.sender)["input"], 10)
 
+
+    def test_write_sandbox_configuration(self):
+        self.assertIn("Sandbox: workspace-write", self.bot.handle(self.sender, "/status"))
+        with patch.dict(os.environ, {"CODEX_SANDBOX_MODE": "danger-full-access"}):
+            self.assertEqual(botmod.Config().codex_sandbox, "danger-full-access")
+            with self.assertRaisesRegex(RuntimeError, "CODEX_SANDBOX_MODE"):
+                botmod.Config().validate()
+
+    def test_cancel_queued_task_by_number(self):
+        self.bot.handle(self.sender, "/new robotics")
+        self.bot.handle(self.sender, "Do a queued task", "wamid.q")
+        job = self.store.pending_jobs(self.sender)[0]
+        self.assertIn(str(job["id"]), self.bot.handle(self.sender, "/jobs"))
+        response = self.bot.handle(self.sender, f"/cancel {job['id']}")
+        self.assertIn("cancelled before starting", response)
+        self.assertEqual(self.store.get_turn(job["id"])["status"], "cancelled")
+        self.assertIsNone(self.store.claim_turn())
+        self.assertEqual(self.bot.handle(self.sender, f"/cancel {job['id']}").split()[-1], "(cancelled).")
+        self.assertIn("Cancelled", self.bot.handle(self.sender, "/history 1"))
+
+    def test_cancel_running_task_does_not_affect_other_sender(self):
+        self.bot.handle(self.sender, "Modify source", "wamid.running")
+        turn = self.store.claim_turn()
+        self.assertIsNotNone(turn)
+        task_id = turn["id"]
+        self.assertEqual(self.store.cancel_turn("99999999999", task_id)["state"], "missing")
+        self.assertFalse(self.store.is_cancel_requested(task_id))
+        response = self.bot.handle(self.sender, f"/cancel {task_id}")
+        self.assertIn("Cancellation requested", response)
+        self.assertIn("cancelling", self.bot.handle(self.sender, "/jobs"))
+        self.assertEqual(self.store.cancel_turn(self.sender, task_id)["state"], "already_requested")
+        self.assertEqual(self.store.finish_turn(turn, "Finished", "done", "thread-x"), "cancelled")
+        self.assertEqual(self.store.get_turn(task_id)["status"], "cancelled")
+        self.assertIsNone(self.store.current(self.sender)["thread_id"])
+
+    def test_bot_cancel_live_codex_worker(self):
+        import threading
+        fake = ROOT / "tests" / "fake_appserver.py"
+        self.bot.cfg.codex_bin = str(fake)
+        self.bot.cfg.task_timeout = 15
+        self.bot.handle(self.sender, "sleep_forever", "wamid.slow")
+        thread = threading.Thread(target=self.bot.task_worker, daemon=True)
+        thread.start()
+        job_id = self.store.pending_jobs(self.sender)[0]["id"]
+        import time
+        deadline = time.monotonic() + 5
+        while self.store.get_turn(job_id)["status"] != "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.store.get_turn(job_id)["status"], "running")
+        self.assertIn("Cancellation requested", self.bot.handle(self.sender, f"/cancel {job_id}"))
+        deadline = time.monotonic() + 6
+        while self.store.get_turn(job_id)["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.bot.stop_event.set()
+        thread.join(timeout=2)
+        self.assertEqual(self.store.get_turn(job_id)["status"], "cancelled")
+        self.assertFalse(thread.is_alive())
+
     def test_different_projects_can_run_independently(self):
         self.bot.handle(self.sender, "/new robotics")
         self.bot.handle(self.sender, f"/project {self.repo2}")
@@ -169,6 +228,18 @@ class BotTests(unittest.TestCase):
         migrated = Store(old, str(self.repo1))
         self.assertEqual(migrated.current(self.sender)["model"], "model-from-old")
         self.assertEqual(migrated.current(self.sender)["thread_id"], "old-thread")
+
+    def test_whatsapp_approval_commands_are_sender_scoped(self):
+        self.bot.handle(self.sender, "request_command", "wamid.approval")
+        turn = self.store.claim_turn()
+        approval_id = self.store.create_approval(
+            turn, "item/commandExecution/requestApproval", "997",
+            "Run echo hello in the sandbox", timeout=120)
+        self.assertIn(str(approval_id), self.bot.handle(self.sender, "/approvals"))
+        self.assertIn("not found", self.bot.handle("99999999999", f"/approve {approval_id}"))
+        self.assertIn("Approved", self.bot.handle(self.sender, f"/approve {approval_id}"))
+        self.assertEqual(self.store.approval_decision(approval_id), "approved")
+        self.assertIn("approved; it can no longer", self.bot.handle(self.sender, f"/deny {approval_id}"))
 
     def test_outbox_large_messages_are_split_and_ordered(self):
         self.store.reply(self.sender, "x" * 7100)
