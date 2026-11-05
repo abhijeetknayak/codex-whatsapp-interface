@@ -76,7 +76,7 @@ Gunicorn should bind `127.0.0.1:8000`, not all network interfaces. Your Cloudfla
 ## Tests
 
 ```bash
-cd whatsapp_codex_v2
+cd codex-whatsapp-interface
 PYTHONPATH=.:tests python -m unittest discover -s tests -v
 ```
 
