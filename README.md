@@ -1,4 +1,4 @@
-# WhatsApp ↔ Codex v2
+# WhatsApp ↔ Codex
 
 A locally hosted WhatsApp Cloud API bridge for an already-authorized Codex CLI installation. Developed for Ubuntu (`nayaka5`), Python 3.11+, and WhatsApp Cloud API webhooks. It does **not** use OpenAI API keys: it launches the locally authenticated Codex CLI under the same Linux account, inheriting its effective Codex settings and sandbox restrictions.
 
@@ -35,50 +35,6 @@ A locally hosted WhatsApp Cloud API bridge for an already-authorized Codex CLI i
 | `/project` or `/project /approved/project` | Show/set chat's working directory inside configured roots |
 
 **Example workflow:** `/new robotics` → `Fix sensor calibration, run tests` → `/use planning` → `Explain the trajectory code` → `/use robotics` to see the latest exchange. If both projects point to the same directory, the second *task waits* while commands and chat switching still work.
-
-## Upgrade from your existing WhatsApp bot
-
-**Stop the old bot first.** Do not run both versions simultaneously. Keep your existing Cloudflare Tunnel running if it's already pointing to port 8000.
-
-```bash
-# Stop existing python bot.py in tmux first (Ctrl+C), then:
-cd /home/ubuntu
-unzip whatsapp_codex_v2.zip
-cd whatsapp_codex_v2
-
-# Keep a backup of your current bot database and environment.
-cp /home/ubuntu/whatsapp_codex_native_permissions/.env .env
-cp /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3 \
-   /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3.backup
-cp /home/ubuntu/whatsapp_codex_native_permissions/bot.sqlite3 ./bot.sqlite3
-chmod 600 .env
-nano .env
-```
-
-If your old database path was customized with `BOT_DB_PATH`, copy **that** file instead (with the old bot stopped). If you have no previous database, skip the copies. The v2 database **adds columns** to your old `chats` table and migrates `chat_model_choices` when present. It does not delete saved Codex CLI sessions.
-
-In `.env`, **update these three paths**:
-
-```dotenv
-CODEX_PROJECT_DIR=/home/ubuntu/VLA-Planning
-CODEX_ALLOWED_ROOTS=/home/ubuntu/VLA-Planning
-BOT_DB_PATH=/home/ubuntu/whatsapp_codex_v2/bot.sqlite3
-```
-
-Add any additional approved project directories to `CODEX_ALLOWED_ROOTS`, comma-separated. Existing imported chats from projects outside allowed roots can still exist in SQLite; import and `/project` cannot select unauthorized paths. Run v2 as `ubuntu` to use the same `~/.codex` login and model catalog.
-
-Install Python dependencies in your **existing environment** (Conda `agent` in your previous logs):
-
-```bash
-conda activate agent
-cd /home/ubuntu/whatsapp_codex_v2
-python -m pip install -r requirements.txt
-python -m py_compile bot.py codex_api.py store.py
-codex --version
-python bot.py
-```
-
-Your signed webhook still accepts `GET /webhook` and `POST /webhook`; the callback URL in Meta remains `https://YOUR-STABLE-HOST/webhook`. You don't need to re-subscribe your WABA merely because the Python process changed. Keep a valid system-user access token in `.env` and verify its **WhatsApp asset assignment** (previous Meta error `Viewer cannot access the provided Paid Message Account`). The app, phone ID, and App Secret must belong to the same configuration.
 
 ### First tests from your phone
 
